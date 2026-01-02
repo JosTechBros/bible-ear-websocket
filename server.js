@@ -457,6 +457,8 @@ async function initializeAWSStream(sessionId, ws) {
       errorMessage = 'AWS credentials invalid. Check accessKey/secretKey in Firestore.';
     } else if (error.message.includes('Eventstream payload')) {
       errorMessage = 'AWS Transcribe stream configuration error. Check server logs.';
+    } else if (error.message.includes('concurrent streams')) {
+      errorMessage = 'AWS Transcribe concurrent stream limit reached. Try again in a few minutes.';
     }
     
     sendError(sessionId, errorMessage, ws);
@@ -631,6 +633,24 @@ async function cleanupSession(sessionId) {
   console.log(`✅ Session cleaned up: ${sessionId}`);
 }
 
+// ========== SESSION CLEANUP CRON ==========
+async function cleanupOldSessions() {
+  const now = Date.now();
+  const SESSION_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+  
+  console.log(`🕐 Running session cleanup. Active sessions: ${activeSessions.size}`);
+  
+  for (const [sessionId, session] of activeSessions.entries()) {
+    if (now - session.startTime > SESSION_TIMEOUT) {
+      console.log(`🕐 Cleaning up old session: ${sessionId} (age: ${Math.round((now - session.startTime) / 1000)}s)`);
+      await cleanupSession(sessionId);
+    }
+  }
+}
+
+// Run cleanup every minute
+setInterval(cleanupOldSessions, 60000);
+
 // ========== WEB SOCKET SERVER ==========
 const wss = new WebSocket.Server({ noServer: true });
 
@@ -724,6 +744,7 @@ wss.on('connection', async (ws, req) => {
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🔗 WebSocket endpoint: ws://localhost:${PORT}/transcriptionWebSocket/{sessionId}`);
+  console.log(`🕐 Session cleanup enabled: Every 60 seconds, timeout: 5 minutes`);
 });
 
 // Handle WebSocket upgrades
@@ -749,7 +770,8 @@ app.get('/', (req, res) => {
       health: '/health'
     },
     active_sessions: activeSessions.size,
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    cleanup: 'Every 60 seconds, timeout: 5 minutes'
   });
 });
 
@@ -758,7 +780,8 @@ app.get('/health', (req, res) => {
     status: 'healthy',
     timestamp: new Date().toISOString(),
     active_sessions: activeSessions.size,
-    memory: process.memoryUsage()
+    memory: process.memoryUsage(),
+    cleanup_enabled: true
   });
 });
 
