@@ -20,6 +20,12 @@ const db = admin.firestore();
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+// ========== CONFIGURATION CONSTANTS ==========
+const AWS_CONNECTION_POOL = new Map();
+const CONNECTION_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+const MAX_POOL_SIZE = 5; // Maximum connections to keep in pool
+const AUDIO_CHUNK_TIMEOUT = 15000; // 15 seconds (AWS timeout)
+
 // ========== CREDENTIALS MANAGER ==========
 let transcribeClient = null;
 let credentialsCache = {
@@ -89,6 +95,7 @@ async function getTranscribeClient() {
     transcribeClient = new TranscribeStreamingClient({
       region: credentials.aws.region,
       credentials: credentials.aws,
+      maxAttempts: 2, // Reduce retry attempts
     });
   }
   return transcribeClient;
@@ -111,6 +118,57 @@ async function getAlgoliaIndexForVersion(version = 'kjv') {
     credentials.algolia.adminKey
   );
   return algoliaClient.initIndex(indexName);
+}
+
+// ========== AWS CONNECTION POOL MANAGEMENT ==========
+function getPoolKey(session) {
+  return `${session.userId}_${session.language}_${session.currentVersion}`;
+}
+
+function cleanupStalePoolConnections() {
+  const now = Date.now();
+  let cleaned = 0;
+  
+  for (const [key, connection] of AWS_CONNECTION_POOL.entries()) {
+    if (now - connection.lastUsed > CONNECTION_TIMEOUT) {
+      console.log(`🧹 Removing stale connection from pool: ${key}`);
+      try {
+        if (connection.audioStream) {
+          connection.audioStream.destroy();
+        }
+      } catch (err) {
+        // Ignore cleanup errors
+      }
+      AWS_CONNECTION_POOL.delete(key);
+      cleaned++;
+    }
+  }
+  
+  // Enforce max pool size
+  if (AWS_CONNECTION_POOL.size > MAX_POOL_SIZE) {
+    const entries = Array.from(AWS_CONNECTION_POOL.entries());
+    entries.sort((a, b) => a[1].lastUsed - b[1].lastUsed); // Oldest first
+    
+    for (let i = 0; i < entries.length - MAX_POOL_SIZE; i++) {
+      const [key, connection] = entries[i];
+      console.log(`📦 Pool full, removing: ${key}`);
+      try {
+        if (connection.audioStream) {
+          connection.audioStream.destroy();
+        }
+      } catch (err) {
+        // Ignore cleanup errors
+      }
+      AWS_CONNECTION_POOL.delete(key);
+      cleaned++;
+    }
+  }
+  
+  if (cleaned > 0) {
+    console.log(`🧹 Cleaned ${cleaned} connections from pool. Remaining: ${AWS_CONNECTION_POOL.size}`);
+  }
+  
+  return cleaned;
 }
 
 // ========== BIBLE VERSION DETECTION ==========
@@ -363,6 +421,7 @@ function sendError(sessionId, errorMessage, ws) {
   }
 }
 
+// ========== AWS STREAM MANAGEMENT ==========
 async function handleAudioChunk(sessionId, audioChunk, ws) {
   const session = activeSessions.get(sessionId);
   if (!session) return;
@@ -373,6 +432,9 @@ async function handleAudioChunk(sessionId, audioChunk, ws) {
     }
 
     const audioBuffer = Buffer.from(audioChunk, 'base64');
+    
+    // Reset audio timeout
+    session.lastAudioChunkTime = Date.now();
     
     // Send audio chunk to AWS Transcribe
     if (session.writeAudioChunk) {
@@ -388,6 +450,26 @@ async function handleAudioChunk(sessionId, audioChunk, ws) {
 async function initializeAWSStream(sessionId, ws) {
   const session = activeSessions.get(sessionId);
   if (!session) return;
+
+  // Check for existing connection in pool
+  const poolKey = getPoolKey(session);
+  const pooledConnection = AWS_CONNECTION_POOL.get(poolKey);
+  
+  if (pooledConnection && (Date.now() - pooledConnection.lastUsed < CONNECTION_TIMEOUT)) {
+    console.log(`♻️ Reusing pooled AWS connection for ${poolKey}`);
+    session.audioStream = pooledConnection.audioStream;
+    session.writeAudioChunk = pooledConnection.writeAudioChunk;
+    session.pooledConnection = true;
+    pooledConnection.lastUsed = Date.now();
+    pooledConnection.activeSessions.add(sessionId);
+    
+    ws.send(JSON.stringify({
+      type: 'status',
+      message: 'Transcription started (reused connection)',
+      timestamp: Date.now()
+    }));
+    return;
+  }
 
   try {
     const transcribeClient = await getTranscribeClient();
@@ -421,6 +503,7 @@ async function initializeAWSStream(sessionId, ws) {
 
     const response = await transcribeClient.send(command);
     session.audioStream = response;
+    session.pooledConnection = false;
     
     // Store the write function for audio chunks
     session.writeAudioChunk = (chunk) => {
@@ -429,39 +512,59 @@ async function initializeAWSStream(sessionId, ws) {
       }
     };
 
+    // Store in connection pool (for reuse)
+    AWS_CONNECTION_POOL.set(poolKey, {
+      audioStream: response,
+      writeAudioChunk: session.writeAudioChunk,
+      lastUsed: Date.now(),
+      userId: session.userId,
+      language: session.language,
+      version: session.currentVersion,
+      activeSessions: new Set([sessionId])
+    });
+
     response.TranscriptResultStream.on('data', async (event) => {
       await processTranscriptionResult(sessionId, event, ws);
     });
 
     response.TranscriptResultStream.on('error', (error) => {
       console.error('❌ AWS stream error:', error);
+      AWS_CONNECTION_POOL.delete(poolKey); // Remove from pool on error
       sendError(sessionId, 'Transcription stream error', ws);
     });
 
     response.TranscriptResultStream.on('end', () => {
       console.log('✅ AWS Transcribe stream ended');
+      AWS_CONNECTION_POOL.delete(poolKey); // Clean up pool
     });
 
     ws.send(JSON.stringify({
       type: 'status',
-      message: 'Transcription started',
+      message: 'Transcription started (new connection)',
       timestamp: Date.now()
     }));
 
   } catch (error) {
     console.error('❌ AWS initialization error:', error);
     
-    let errorMessage = `Failed to start transcription: ${error.message}`;
+    let errorMessage = 'Failed to start transcription.';
+    let userMessage = 'Failed to start transcription. Please try again.';
     
     if (error.name === 'InvalidSignatureException') {
       errorMessage = 'AWS credentials invalid. Check accessKey/secretKey in Firestore.';
-    } else if (error.message.includes('Eventstream payload')) {
-      errorMessage = 'AWS Transcribe stream configuration error. Check server logs.';
+      userMessage = 'Configuration error. Please check backend settings.';
     } else if (error.message.includes('concurrent streams')) {
       errorMessage = 'AWS Transcribe concurrent stream limit reached. Try again in a few minutes.';
+      userMessage = 'Transcription service busy. Please try again in a few minutes.';
+      // Clean up any stale connections
+      cleanupStalePoolConnections();
+    } else if (error.message.includes('timed out')) {
+      errorMessage = 'AWS Transcribe connection timed out.';
+      userMessage = 'Connection timeout. Please try again.';
     }
     
-    sendError(sessionId, errorMessage, ws);
+    console.error('AWS Error details:', error.message);
+    sendError(sessionId, userMessage, ws);
     throw error;
   }
 }
@@ -566,6 +669,28 @@ async function processTranscriptionResult(sessionId, event, ws) {
   }
 }
 
+// ========== AUDIO TIMEOUT CHECK ==========
+function checkAudioTimeouts() {
+  const now = Date.now();
+  
+  for (const [sessionId, session] of activeSessions.entries()) {
+    if (session.lastAudioChunkTime && (now - session.lastAudioChunkTime > AUDIO_CHUNK_TIMEOUT)) {
+      console.log(`⏰ Audio timeout for session ${sessionId}, closing stream`);
+      
+      // Send end signal to AWS stream
+      if (session.writeAudioChunk) {
+        session.writeAudioChunk(null);
+      }
+      
+      // Update session to indicate audio stopped
+      session.lastAudioChunkTime = null;
+      
+      sendError(sessionId, 'Audio stream timeout. Please restart recording.', session.ws);
+    }
+  }
+}
+
+// ========== CONTROL MESSAGE HANDLING ==========
 async function handleControlMessage(sessionId, data, ws) {
   const session = activeSessions.get(sessionId);
   if (!session) return;
@@ -589,9 +714,33 @@ async function handleControlMessage(sessionId, data, ws) {
   }
 }
 
+// ========== SESSION CLEANUP ==========
 async function cleanupSession(sessionId) {
   const session = activeSessions.get(sessionId);
   if (!session) return;
+  
+  // Clean from connection pool if this session created it
+  if (!session.pooledConnection) {
+    const poolKey = getPoolKey(session);
+    const pooledConnection = AWS_CONNECTION_POOL.get(poolKey);
+    
+    if (pooledConnection && pooledConnection.activeSessions) {
+      pooledConnection.activeSessions.delete(sessionId);
+      
+      // If no more active sessions using this connection, clean it up
+      if (pooledConnection.activeSessions.size === 0) {
+        console.log(`🧹 Removing pool connection ${poolKey} (no active sessions)`);
+        try {
+          if (pooledConnection.audioStream) {
+            pooledConnection.audioStream.destroy();
+          }
+        } catch (err) {
+          // Ignore cleanup errors
+        }
+        AWS_CONNECTION_POOL.delete(poolKey);
+      }
+    }
+  }
   
   // Send end signal to AWS stream
   if (session.writeAudioChunk) {
@@ -633,12 +782,12 @@ async function cleanupSession(sessionId) {
   console.log(`✅ Session cleaned up: ${sessionId}`);
 }
 
-// ========== SESSION CLEANUP CRON ==========
+// ========== PERIODIC CLEANUP ==========
 async function cleanupOldSessions() {
   const now = Date.now();
-  const SESSION_TIMEOUT = 5 * 60 * 1000; // 5 minutes
+  const SESSION_TIMEOUT = 10 * 60 * 1000; // 10 minutes
   
-  console.log(`🕐 Running session cleanup. Active sessions: ${activeSessions.size}`);
+  console.log(`🕐 Running cleanup. Active: ${activeSessions.size}, Pool: ${AWS_CONNECTION_POOL.size}`);
   
   for (const [sessionId, session] of activeSessions.entries()) {
     if (now - session.startTime > SESSION_TIMEOUT) {
@@ -646,10 +795,10 @@ async function cleanupOldSessions() {
       await cleanupSession(sessionId);
     }
   }
+  
+  // Clean stale pool connections
+  cleanupStalePoolConnections();
 }
-
-// Run cleanup every minute
-setInterval(cleanupOldSessions, 60000);
 
 // ========== WEB SOCKET SERVER ==========
 const wss = new WebSocket.Server({ noServer: true });
@@ -681,9 +830,11 @@ wss.on('connection', async (ws, req) => {
       startTime: Date.now(),
       audioStream: null,
       writeAudioChunk: null,
+      pooledConnection: false,
       transcriptBuffer: '',
       lastTriggerTime: 0,
       lastVerseReferenceTime: 0,
+      lastAudioChunkTime: null,
       versionHistory: ['kjv']
     });
 
@@ -744,7 +895,7 @@ wss.on('connection', async (ws, req) => {
 const server = app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🔗 WebSocket endpoint: ws://localhost:${PORT}/transcriptionWebSocket/{sessionId}`);
-  console.log(`🕐 Session cleanup enabled: Every 60 seconds, timeout: 5 minutes`);
+  console.log(`🕐 Cleanup enabled: Sessions=10min, Pool=5min, Audio=15s`);
 });
 
 // Handle WebSocket upgrades
@@ -760,18 +911,32 @@ server.on('upgrade', (request, socket, head) => {
   }
 });
 
-// Health check endpoints
+// ========== SCHEDULED TASKS ==========
+// Run cleanup every minute
+setInterval(cleanupOldSessions, 60000);
+
+// Check audio timeouts every 5 seconds
+setInterval(checkAudioTimeouts, 5000);
+
+// Log status every 2 minutes
+setInterval(() => {
+  console.log(`📊 Status: ${activeSessions.size} active sessions, ${AWS_CONNECTION_POOL.size} pooled connections`);
+}, 120000);
+
+// ========== HEALTH CHECK ENDPOINTS ==========
 app.get('/', (req, res) => {
   res.json({
     service: 'Bible Ear WebSocket Server',
     status: 'running',
+    version: '2.0.0',
     endpoints: {
       websocket: '/transcriptionWebSocket/{sessionId}',
-      health: '/health'
+      health: '/health',
+      stats: '/stats'
     },
     active_sessions: activeSessions.size,
-    uptime: process.uptime(),
-    cleanup: 'Every 60 seconds, timeout: 5 minutes'
+    pooled_connections: AWS_CONNECTION_POOL.size,
+    uptime: process.uptime()
   });
 });
 
@@ -780,9 +945,29 @@ app.get('/health', (req, res) => {
     status: 'healthy',
     timestamp: new Date().toISOString(),
     active_sessions: activeSessions.size,
-    memory: process.memoryUsage(),
-    cleanup_enabled: true
+    pooled_connections: AWS_CONNECTION_POOL.size,
+    memory: process.memoryUsage()
   });
 });
 
-console.log('✅ WebSocket server ready');
+app.get('/stats', (req, res) => {
+  const stats = {
+    active_sessions: Array.from(activeSessions.entries()).map(([id, session]) => ({
+      id,
+      userId: session.userId,
+      age_seconds: Math.round((Date.now() - session.startTime) / 1000),
+      version: session.currentVersion,
+      last_audio: session.lastAudioChunkTime ? Math.round((Date.now() - session.lastAudioChunkTime) / 1000) + 's ago' : 'never'
+    })),
+    pooled_connections: Array.from(AWS_CONNECTION_POOL.entries()).map(([key, conn]) => ({
+      key,
+      age_seconds: Math.round((Date.now() - conn.lastUsed) / 1000),
+      active_sessions: Array.from(conn.activeSessions || [])
+    })),
+    memory: process.memoryUsage()
+  };
+  
+  res.json(stats);
+});
+
+console.log('✅ WebSocket server ready (Optimized v2.0.0)');
