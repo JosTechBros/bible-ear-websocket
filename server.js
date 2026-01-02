@@ -4,6 +4,7 @@ const express = require('express');
 const admin = require('firebase-admin');
 const algoliasearch = require('algoliasearch');
 const crypto = require('crypto');
+const { Readable } = require('stream');
 
 // Initialize Firebase from environment variable
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
@@ -372,8 +373,10 @@ async function handleAudioChunk(sessionId, audioChunk, ws) {
     }
 
     const audioBuffer = Buffer.from(audioChunk, 'base64');
-    if (session.audioStream && session.audioStream.AudioStream) {
-      await session.audioStream.AudioStream.write(audioBuffer);
+    
+    // Send audio chunk to AWS Transcribe
+    if (session.writeAudioChunk) {
+      session.writeAudioChunk(audioBuffer);
     }
 
   } catch (error) {
@@ -389,17 +392,43 @@ async function initializeAWSStream(sessionId, ws) {
   try {
     const transcribeClient = await getTranscribeClient();
     
+    // Create a proper Readable stream for AWS Transcribe
+    let audioBufferCallback;
+    const audioStreamGenerator = async function* () {
+      while (true) {
+        const chunk = await new Promise(resolve => {
+          audioBufferCallback = resolve;
+        });
+        if (chunk === null) break; // End stream signal
+        yield {
+          AudioEvent: {
+            AudioChunk: chunk
+          }
+        };
+      }
+    };
+
+    const audioStream = Readable.from(audioStreamGenerator());
+
     const command = new StartStreamTranscriptionCommand({
       LanguageCode: session.language || 'en-US',
       MediaEncoding: 'pcm',
       MediaSampleRateHertz: 16000,
       EnablePartialResultsStabilization: true,
       PartialResultsStability: 'medium',
+      AudioStream: audioStream
     });
 
     const response = await transcribeClient.send(command);
     session.audioStream = response;
     
+    // Store the write function for audio chunks
+    session.writeAudioChunk = (chunk) => {
+      if (audioBufferCallback) {
+        audioBufferCallback(chunk);
+      }
+    };
+
     response.TranscriptResultStream.on('data', async (event) => {
       await processTranscriptionResult(sessionId, event, ws);
     });
@@ -407,6 +436,10 @@ async function initializeAWSStream(sessionId, ws) {
     response.TranscriptResultStream.on('error', (error) => {
       console.error('❌ AWS stream error:', error);
       sendError(sessionId, 'Transcription stream error', ws);
+    });
+
+    response.TranscriptResultStream.on('end', () => {
+      console.log('✅ AWS Transcribe stream ended');
     });
 
     ws.send(JSON.stringify({
@@ -422,6 +455,8 @@ async function initializeAWSStream(sessionId, ws) {
     
     if (error.name === 'InvalidSignatureException') {
       errorMessage = 'AWS credentials invalid. Check accessKey/secretKey in Firestore.';
+    } else if (error.message.includes('Eventstream payload')) {
+      errorMessage = 'AWS Transcribe stream configuration error. Check server logs.';
     }
     
     sendError(sessionId, errorMessage, ws);
@@ -434,92 +469,94 @@ async function processTranscriptionResult(sessionId, event, ws) {
   if (!session) return;
 
   try {
-    const results = event.TranscriptEvent.Transcript.Results;
+    const results = event.TranscriptEvent?.Transcript?.Results;
     
     if (results && results.length > 0) {
       const result = results[0];
-      const transcript = result.Alternatives[0].Transcript;
+      const transcript = result.Alternatives[0]?.Transcript || '';
       
-      session.transcriptBuffer += ' ' + transcript;
-      
-      const words = session.transcriptBuffer.split(/\s+/);
-      if (words.length > 200) {
-        session.transcriptBuffer = words.slice(-200).join(' ');
-      }
-      
-      const detectedVersion = detectBibleVersion(session.transcriptBuffer);
-      if (detectedVersion && detectedVersion !== session.currentVersion) {
-        session.currentVersion = detectedVersion;
-        ws.send(JSON.stringify({
-          type: 'version_changed',
-          from: 'KJV',
-          to: detectedVersion.toUpperCase(),
-          version: detectedVersion,
-          timestamp: Date.now()
-        }));
-      }
-      
-      if (!result.IsPartial) {
-        ws.send(JSON.stringify({
-          type: 'transcript',
-          text: transcript,
-          isPartial: false,
-          timestamp: Date.now()
-        }));
+      if (transcript) {
+        session.transcriptBuffer += ' ' + transcript;
         
-        const verseRef = detectVerseReference(session.transcriptBuffer);
-        if (verseRef && (Date.now() - session.lastVerseReferenceTime > 3000)) {
-          session.lastVerseReferenceTime = Date.now();
-          console.log(`📖 Direct verse reference detected: ${verseRef.fullReference}`);
-          await searchExactVerse(sessionId, verseRef, session.currentVersion, ws);
+        const words = session.transcriptBuffer.split(/\s+/);
+        if (words.length > 200) {
+          session.transcriptBuffer = words.slice(-200).join(' ');
         }
         
-        const trigger = detectTriggerPhrase(session.transcriptBuffer);
-        if (trigger && (Date.now() - session.lastTriggerTime > 5000)) {
-          session.lastTriggerTime = Date.now();
-          console.log(`🔔 Trigger: "${trigger.trigger}", Query: "${trigger.query}"`);
-          
+        const detectedVersion = detectBibleVersion(session.transcriptBuffer);
+        if (detectedVersion && detectedVersion !== session.currentVersion) {
+          session.currentVersion = detectedVersion;
           ws.send(JSON.stringify({
-            type: 'trigger_detected',
-            trigger: trigger.trigger,
-            query: trigger.query,
-            version: session.currentVersion,
+            type: 'version_changed',
+            from: 'KJV',
+            to: detectedVersion.toUpperCase(),
+            version: detectedVersion,
+            timestamp: Date.now()
+          }));
+        }
+        
+        if (!result.IsPartial) {
+          ws.send(JSON.stringify({
+            type: 'transcript',
+            text: transcript,
+            isPartial: false,
             timestamp: Date.now()
           }));
           
-          try {
-            const index = await getAlgoliaIndexForVersion(session.currentVersion);
-            const searchQuery = prepareAlgoliaQuery(trigger.query);
-            
-            const { hits } = await index.search(searchQuery, {
-              hitsPerPage: 10,
-              attributesToRetrieve: ['*'],
-              attributesToHighlight: ['text']
-            });
-            
-            if (hits.length > 0) {
-              const passages = formatSearchResults(hits);
-              
-              ws.send(JSON.stringify({
-                type: 'passages_found',
-                trigger: trigger.trigger,
-                query: trigger.query,
-                version: session.currentVersion,
-                passages: passages,
-                timestamp: Date.now()
-              }));
-            }
-          } catch (error) {
-            console.error('❌ Search error:', error);
+          const verseRef = detectVerseReference(session.transcriptBuffer);
+          if (verseRef && (Date.now() - session.lastVerseReferenceTime > 3000)) {
+            session.lastVerseReferenceTime = Date.now();
+            console.log(`📖 Direct verse reference detected: ${verseRef.fullReference}`);
+            await searchExactVerse(sessionId, verseRef, session.currentVersion, ws);
           }
+          
+          const trigger = detectTriggerPhrase(session.transcriptBuffer);
+          if (trigger && (Date.now() - session.lastTriggerTime > 5000)) {
+            session.lastTriggerTime = Date.now();
+            console.log(`🔔 Trigger: "${trigger.trigger}", Query: "${trigger.query}"`);
+            
+            ws.send(JSON.stringify({
+              type: 'trigger_detected',
+              trigger: trigger.trigger,
+              query: trigger.query,
+              version: session.currentVersion,
+              timestamp: Date.now()
+            }));
+            
+            try {
+              const index = await getAlgoliaIndexForVersion(session.currentVersion);
+              const searchQuery = prepareAlgoliaQuery(trigger.query);
+              
+              const { hits } = await index.search(searchQuery, {
+                hitsPerPage: 10,
+                attributesToRetrieve: ['*'],
+                attributesToHighlight: ['text']
+              });
+              
+              if (hits.length > 0) {
+                const passages = formatSearchResults(hits);
+                
+                ws.send(JSON.stringify({
+                  type: 'passages_found',
+                  trigger: trigger.trigger,
+                  query: trigger.query,
+                  version: session.currentVersion,
+                  passages: passages,
+                  timestamp: Date.now()
+                }));
+              }
+            } catch (error) {
+              console.error('❌ Search error:', error);
+            }
+          }
+        } else {
+          ws.send(JSON.stringify({
+            type: 'partial_transcript',
+            text: transcript,
+            isPartial: true,
+            timestamp: Date.now()
+          }));
         }
-      } else {
-        ws.send(JSON.stringify({
-          type: 'partial_transcript',
-          text: transcript,
-          isPartial: true,
-          timestamp: Date.now()
-        }));
       }
     }
   } catch (error) {
@@ -553,6 +590,11 @@ async function handleControlMessage(sessionId, data, ws) {
 async function cleanupSession(sessionId) {
   const session = activeSessions.get(sessionId);
   if (!session) return;
+  
+  // Send end signal to AWS stream
+  if (session.writeAudioChunk) {
+    session.writeAudioChunk(null);
+  }
   
   if (session.audioStream) {
     try {
@@ -618,6 +660,7 @@ wss.on('connection', async (ws, req) => {
       currentVersion: 'kjv',
       startTime: Date.now(),
       audioStream: null,
+      writeAudioChunk: null,
       transcriptBuffer: '',
       lastTriggerTime: 0,
       lastVerseReferenceTime: 0,
