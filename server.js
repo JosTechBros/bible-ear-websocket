@@ -95,7 +95,7 @@ async function getTranscribeClient() {
     transcribeClient = new TranscribeStreamingClient({
       region: credentials.aws.region,
       credentials: credentials.aws,
-      maxAttempts: 2, // Reduce retry attempts
+      maxAttempts: 2,
     });
   }
   return transcribeClient;
@@ -431,20 +431,85 @@ async function handleAudioChunk(sessionId, audioChunk, ws) {
       await initializeAWSStream(sessionId, ws);
     }
 
-    const audioBuffer = Buffer.from(audioChunk, 'base64');
-    
     // Reset audio timeout
     session.lastAudioChunkTime = Date.now();
     
-    // Send audio chunk to AWS Transcribe
-    if (session.writeAudioChunk) {
+    // Send heartbeat to keep connection alive
+    if (session.writeAudioChunk && session.audioStream) {
+      const audioBuffer = Buffer.from(audioChunk, 'base64');
+      
+      // Send audio chunk to AWS Transcribe
       session.writeAudioChunk(audioBuffer);
+      
+      // Update audio chunks counter
+      session.audioChunksSent = (session.audioChunksSent || 0) + 1;
+      
+      // Log periodically
+      if (session.audioChunksSent % 20 === 0) {
+        console.log(`🔊 Sent ${session.audioChunksSent} audio chunks to AWS for session ${sessionId}`);
+      }
     }
 
   } catch (error) {
     console.error('❌ Error handling audio:', error);
-    sendError(sessionId, 'Audio processing failed', ws);
+    
+    // More detailed error logging
+    if (error.$response) {
+      console.error('AWS Response:', error.$response);
+    }
+    
+    // Send specific error message
+    let errorMsg = 'Audio processing failed';
+    if (error.Message && error.Message.includes('timed out')) {
+      errorMsg = 'Audio stream timeout. Please check microphone and try again.';
+      
+      // Reset AWS connection on timeout
+      if (session.audioStream) {
+        try {
+          if (session.writeAudioChunk) {
+            session.writeAudioChunk(null);
+          }
+          session.audioStream.destroy();
+        } catch (e) {
+          console.error('Error cleaning up stream:', e);
+        }
+        session.audioStream = null;
+        session.writeAudioChunk = null;
+      }
+    }
+    
+    sendError(sessionId, errorMsg, ws);
   }
+}
+
+// ========== AUDIO KEEP-ALIVE ==========
+function startAudioKeepAlive(sessionId) {
+  const session = activeSessions.get(sessionId);
+  if (!session) return;
+
+  // Clear any existing keep-alive
+  if (session.keepAliveInterval) {
+    clearInterval(session.keepAliveInterval);
+  }
+
+  // Send silent audio packets every 5 seconds if no audio is being sent
+  session.keepAliveInterval = setInterval(() => {
+    if (session.writeAudioChunk && 
+        (!session.lastAudioChunkTime || 
+         (Date.now() - session.lastAudioChunkTime > 3000))) {
+      
+      // Create a small silent audio packet (160 samples = 10ms of silence at 16kHz)
+      const silentPacket = Buffer.alloc(320); // 160 samples * 2 bytes per sample (16-bit)
+      
+      try {
+        session.writeAudioChunk(silentPacket);
+        console.log(`🔇 Sent keep-alive silent packet for session ${sessionId}`);
+      } catch (error) {
+        console.error('❌ Keep-alive error:', error);
+        clearInterval(session.keepAliveInterval);
+      }
+    }
+  }, 5000);
 }
 
 async function initializeAWSStream(sessionId, ws) {
@@ -468,6 +533,9 @@ async function initializeAWSStream(sessionId, ws) {
       message: 'Transcription started (reused connection)',
       timestamp: Date.now()
     }));
+    
+    // Start keep-alive
+    startAudioKeepAlive(sessionId);
     return;
   }
 
@@ -544,27 +612,47 @@ async function initializeAWSStream(sessionId, ws) {
       timestamp: Date.now()
     }));
 
+    // Start keep-alive
+    startAudioKeepAlive(sessionId);
+
   } catch (error) {
     console.error('❌ AWS initialization error:', error);
     
+    // Extract the actual error message
     let errorMessage = 'Failed to start transcription.';
     let userMessage = 'Failed to start transcription. Please try again.';
     
-    if (error.name === 'InvalidSignatureException') {
-      errorMessage = 'AWS credentials invalid. Check accessKey/secretKey in Firestore.';
-      userMessage = 'Configuration error. Please check backend settings.';
-    } else if (error.message.includes('concurrent streams')) {
-      errorMessage = 'AWS Transcribe concurrent stream limit reached. Try again in a few minutes.';
-      userMessage = 'Transcription service busy. Please try again in a few minutes.';
-      // Clean up any stale connections
-      cleanupStalePoolConnections();
-    } else if (error.message.includes('timed out')) {
-      errorMessage = 'AWS Transcribe connection timed out.';
-      userMessage = 'Connection timeout. Please try again.';
+    // Check for the actual error properties
+    if (error.Message) {
+      errorMessage = error.Message;
+      if (error.Message.includes('timed out')) {
+        userMessage = 'Connection timeout. Please restart recording.';
+      } else if (error.Message.includes('no new audio')) {
+        userMessage = 'Microphone not sending audio. Please check permissions.';
+      }
+    } else if (error.message) {
+      errorMessage = error.message;
     }
     
-    console.error('AWS Error details:', error.message);
+    // Log detailed error information
+    console.error('AWS Error details:', {
+      name: error.name,
+      message: errorMessage,
+      code: error.code,
+      time: error.time,
+      requestId: error.requestId,
+      statusCode: error.statusCode,
+      retryable: error.retryable,
+      hostname: error.hostname
+    });
+    
+    // Send error to client
     sendError(sessionId, userMessage, ws);
+    
+    // Clean up failed connection
+    const poolKey = getPoolKey(session);
+    AWS_CONNECTION_POOL.delete(poolKey);
+    
     throw error;
   }
 }
@@ -669,6 +757,40 @@ async function processTranscriptionResult(sessionId, event, ws) {
   }
 }
 
+// ========== CONNECTION HEALTH CHECK ==========
+function monitorConnectionHealth() {
+  const now = Date.now();
+  
+  for (const [sessionId, session] of activeSessions.entries()) {
+    // Check if WebSocket is still connected
+    if (session.ws && session.ws.readyState !== WebSocket.OPEN) {
+      console.log(`🔌 Session ${sessionId} WebSocket not open (state: ${session.ws.readyState})`);
+      continue;
+    }
+    
+    // Check audio activity
+    if (session.lastAudioChunkTime && (now - session.lastAudioChunkTime > 10000)) {
+      console.log(`⏰ Session ${sessionId} - No audio for ${Math.round((now - session.lastAudioChunkTime) / 1000)}s`);
+      
+      // Send warning to client
+      if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+        session.ws.send(JSON.stringify({
+          type: 'warning',
+          message: 'No audio detected. Please check microphone.',
+          timestamp: now
+        }));
+      }
+    }
+    
+    // Check AWS stream health
+    if (session.audioStream && session.audioStream.destroyed) {
+      console.log(`💀 Session ${sessionId} - AWS stream destroyed, reinitializing`);
+      session.audioStream = null;
+      session.writeAudioChunk = null;
+    }
+  }
+}
+
 // ========== AUDIO TIMEOUT CHECK ==========
 function checkAudioTimeouts() {
   const now = Date.now();
@@ -719,6 +841,11 @@ async function cleanupSession(sessionId) {
   const session = activeSessions.get(sessionId);
   if (!session) return;
   
+  // Clear keep-alive interval
+  if (session.keepAliveInterval) {
+    clearInterval(session.keepAliveInterval);
+  }
+  
   // Clean from connection pool if this session created it
   if (!session.pooledConnection) {
     const poolKey = getPoolKey(session);
@@ -767,7 +894,8 @@ async function cleanupSession(sessionId) {
       closedAt: admin.firestore.FieldValue.serverTimestamp(),
       duration: Date.now() - session.startTime,
       finalVersion: session.currentVersion,
-      versionHistory: session.versionHistory || ['kjv']
+      versionHistory: session.versionHistory || ['kjv'],
+      audioChunksSent: session.audioChunksSent || 0
     });
     
     await db.collection('bible').doc('credentials').update({
@@ -835,7 +963,9 @@ wss.on('connection', async (ws, req) => {
       lastTriggerTime: 0,
       lastVerseReferenceTime: 0,
       lastAudioChunkTime: null,
-      versionHistory: ['kjv']
+      versionHistory: ['kjv'],
+      audioChunksSent: 0,
+      keepAliveInterval: null
     });
 
     await db.collection('transcription_sessions').doc(sessionId).update({
@@ -857,6 +987,12 @@ wss.on('connection', async (ws, req) => {
             .update({
               lastActivity: admin.firestore.FieldValue.serverTimestamp()
             });
+        } else if (data.type === 'keep_alive') {
+          // Update last activity time for keep-alive
+          const session = activeSessions.get(sessionId);
+          if (session) {
+            session.lastAudioChunkTime = Date.now();
+          }
         }
       } catch (error) {
         console.error('❌ Error processing message:', error);
@@ -918,6 +1054,9 @@ setInterval(cleanupOldSessions, 60000);
 // Check audio timeouts every 5 seconds
 setInterval(checkAudioTimeouts, 5000);
 
+// Monitor connection health every 10 seconds
+setInterval(monitorConnectionHealth, 10000);
+
 // Log status every 2 minutes
 setInterval(() => {
   console.log(`📊 Status: ${activeSessions.size} active sessions, ${AWS_CONNECTION_POOL.size} pooled connections`);
@@ -957,7 +1096,8 @@ app.get('/stats', (req, res) => {
       userId: session.userId,
       age_seconds: Math.round((Date.now() - session.startTime) / 1000),
       version: session.currentVersion,
-      last_audio: session.lastAudioChunkTime ? Math.round((Date.now() - session.lastAudioChunkTime) / 1000) + 's ago' : 'never'
+      last_audio: session.lastAudioChunkTime ? Math.round((Date.now() - session.lastAudioChunkTime) / 1000) + 's ago' : 'never',
+      audio_chunks_sent: session.audioChunksSent || 0
     })),
     pooled_connections: Array.from(AWS_CONNECTION_POOL.entries()).map(([key, conn]) => ({
       key,
